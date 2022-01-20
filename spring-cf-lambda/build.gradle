@@ -1,0 +1,227 @@
+/* Copyright (c) 2021, Factor 10 AB */
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath platform("software.amazon.awssdk:bom:2.17.34")
+        classpath "software.amazon.awssdk:lambda"
+    }
+}
+plugins {
+    id "groovy"
+    id "org.springframework.boot" version "2.5.4"
+    id "io.spring.dependency-management" version "1.0.11.RELEASE"
+    id "com.github.johnrengelman.shadow" version "7.0.0"
+}
+
+version = "0.1"
+group = "com.x10.bootlambda"
+
+if (!project.hasProperty("vmFunction")) {
+    logger.warn("vmFunction not set, deploying the VM lambda won't work. Configure in gradle.properties")
+    logger.warn("vmFunction=...")
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    set("springCloudFunctionVersion", "3.1.3")
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.cloud:spring-cloud-function-dependencies:${springCloudFunctionVersion}"
+        mavenBom "software.amazon.awssdk:bom:2.17.34"
+    }
+}
+
+dependencies {
+
+    implementation "org.springframework.boot:spring-boot-starter"
+    implementation "org.springframework.cloud:spring-cloud-function-context"
+    implementation "org.springframework.cloud:spring-cloud-function-adapter-aws"
+    implementation "org.springframework.cloud:spring-cloud-starter-function-webflux"
+    compileOnly "com.amazonaws:aws-lambda-java-events:2.0.2"
+    compileOnly "com.amazonaws:aws-lambda-java-core:1.1.0"
+
+    implementation "com.google.guava:guava:30.1.1-jre"
+    implementation "software.amazon.awssdk:dynamodb"
+
+    testImplementation "org.springframework.boot:spring-boot-starter-test"
+    testImplementation "org.spockframework:spock-core:2.0-groovy-3.0"
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': "com.x10.lambda.BootLambdaApplication"
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.toVersion("11")
+    targetCompatibility = JavaVersion.toVersion("11")
+}
+
+import software.amazon.awssdk.core.SdkBytes
+import software.amazon.awssdk.services.lambda.LambdaClient
+import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider
+import software.amazon.awssdk.regions.Region
+import software.amazon.awssdk.core.exception.SdkException
+import software.amazon.awssdk.services.lambda.model.LogType
+
+import java.nio.charset.StandardCharsets
+import java.util.regex.Pattern
+
+def getLambdaClient() {
+    def builder = LambdaClient.builder()
+    if (project.hasProperty("awsProfile")) {
+        builder.credentialsProvider(ProfileCredentialsProvider.builder()
+                .profileName(project.property("awsProfile").toString())
+                .build())
+    }
+    if (project.hasProperty("awsRegion")) {
+        builder.region(Region.of(project.property("awsRegion").toString()))
+    }
+    return builder.build()
+}
+
+def doDeployVmLambda(LambdaClient lambda) {
+    def functionName = project.property("vmFunction").toString()
+    def zipFile = file(shadowJar.archiveFile)
+    def functionCode = SdkBytes.fromInputStream(new FileInputStream(zipFile))
+    try {
+        logger.quiet("Updating ${functionName} with code in ${zipFile}")
+        lambda.updateFunctionCode({
+            it.zipFile(functionCode)
+                    .functionName(functionName)
+        })
+        logger.quiet("Waiting for ${functionName} to finish updating")
+        lambda.waiter()
+                .waitUntilFunctionUpdated({
+                    it.functionName(functionName)
+                })
+    } catch (SdkException e) {
+        logger.error("Could not update function ${functionName}")
+        logger.error("You can set awsProfile and awsRegion in gradle.properties to change region and AWS profile")
+        throw e
+    }
+}
+
+
+def doFunctionBenchMark(LambdaClient lambda, String functionName, boolean requireInit, Closure resetFunction) {
+    def reportPattern = Pattern.compile("REPORT RequestId: [a-z0-9-]+\\s+Duration: (?<duration>[0-9.]+) ms\\s+Billed Duration: (?<billed>[0-9.]+) ms\\s+Memory Size: [0-9]+ MB\\s+Max Memory Used: [0-9]+ MB(\\sInit Duration: (?<init>[0-9.]+) ms)?")
+    def invocations = []
+    for (def i = 1; invocations.size() < 100; i++) {
+        resetFunction(i)
+        logger.quiet("Invocation ${i}")
+        def payload = "{ \"name\": \"John Doe\" }"
+        def response = lambda.invoke({
+            it.functionName(functionName)
+                    .payload(SdkBytes.fromString(payload, StandardCharsets.UTF_8))
+            it.logType(LogType.TAIL)
+        })
+        if (response.statusCode() >= 300) {
+            logger.warn("Invocation failed with status " + response.statusCode())
+            logger.warn(response.payload().asString(StandardCharsets.UTF_8))
+        } else {
+            def tail = new String(Base64.decoder.decode(response.logResult()), StandardCharsets.UTF_8)
+            def match = reportPattern.matcher(tail)
+            if (match.find()) {
+                def duration = Double.parseDouble(match.group("duration"))
+                def init = Double.parseDouble(match.group("init") ?: "0")
+                if (requireInit && match.group("init") == null) {
+                    logger.quiet("Disregarding since no init duration is present")
+                    continue
+                }
+                logger.quiet("Duration: {} ms Init: {} ms", duration, init)
+                invocations.add(duration + init)
+            } else {
+                logger.warn("No match found: {}", tail)
+            }
+        }
+    }
+    invocations.sort(Comparator.naturalOrder())
+    def min = invocations[0]
+    def max = invocations[invocations.size() - 1]
+    def mean = invocations.sum() / invocations.size()
+    def median = invocations[invocations.size() / 2]
+    def p95 = invocations[Math.min(invocations.size() - 1, (int)(invocations.size() * 0.95).round())]
+    logger.quiet(String.format("Min: %.3f ms, max: %.3f ms, mean: %.3f ms, median: %.3f ms, p95: %.3f ms", min, max, mean, median, p95))
+    logger.quiet(invocations.toString())
+}
+
+assemble.dependsOn = [shadowJar]
+
+import com.github.jengelman.gradle.plugins.shadow.transformers.*
+
+shadowJar {
+    archiveClassifier = "aws"
+    dependencies {
+        exclude(
+                dependency("org.springframework.cloud:spring-cloud-function-web:${springCloudFunctionVersion}"))
+    }
+
+    // Required for Spring
+    mergeServiceFiles()
+    append 'META-INF/spring.handlers'
+    append 'META-INF/spring.schemas'
+    append 'META-INF/spring.tooling'
+    transform(PropertiesFileTransformer) {
+        paths = ['META-INF/spring.factories']
+        mergeStrategy = "append"
+    }
+}
+
+task deployVmLambda() {
+    dependsOn shadowJar
+    doLast {
+        doDeployVmLambda(getLambdaClient())
+    }
+}
+
+task benchVmLambdaColdStarts() {
+    doLast {
+        def lambda = getLambdaClient()
+        def functionName = project.property("vmFunction").toString()
+        doFunctionBenchMark(lambda, functionName, true) { testrun ->
+            def variables = lambda.getFunctionConfiguration {
+                it.functionName(functionName)
+            }.environment().variables()
+            variables = new HashMap(variables)
+            variables.put("TESTRUN", testrun.toString())
+            lambda.updateFunctionConfiguration {
+                it.environment { env ->
+                    env.variables(variables)
+                }
+                        .functionName(functionName)
+            }
+            lambda.waiter()
+                    .waitUntilFunctionUpdated {
+                        it.functionName(functionName)
+                    }
+        }
+    }
+}
+
+task benchVmLambda() {
+    doLast {
+        def lambda = getLambdaClient()
+        def functionName = project.property("vmFunction").toString()
+        def variables = lambda.getFunctionConfiguration {
+            it.functionName(functionName)
+        }.environment().variables()
+        variables = new HashMap(variables)
+        variables.put("TESTRUN", new Random().nextLong().toString())
+        lambda.updateFunctionConfiguration {
+            it.environment { env ->
+                env.variables(variables)
+            }
+            .functionName(functionName)
+        }
+        doFunctionBenchMark(lambda, functionName, false) {}
+    }
+}
