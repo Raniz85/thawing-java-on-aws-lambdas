@@ -1,0 +1,270 @@
+/* Copyright (c) 2021, Factor 10 AB */
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath platform("software.amazon.awssdk:bom:2.17.34")
+        classpath "software.amazon.awssdk:lambda"
+    }
+}
+plugins {
+    id("groovy") 
+    id("com.github.johnrengelman.shadow") version "7.0.0"
+    id("io.micronaut.application") version "2.0.4"
+}
+
+version = "0.1"
+group = "com.x10.lambda"
+
+if (!project.hasProperty("nativeFunction")) {
+    logger.warn("nativeFunction not set, deploying the native lambda won't work. Configure in gradle.properties")
+    logger.warn("nativeFunction=...")
+}
+
+repositories {
+    mavenCentral()
+}
+
+micronaut {
+    version = "3.0.1"
+    runtime("lambda")
+    testRuntime("spock2")
+    processing {
+        incremental(true)
+        annotations("com.x10.lambda.*")
+    }
+}
+
+dependencies {
+    implementation platform("software.amazon.awssdk:bom:2.17.34")
+
+    annotationProcessor("io.micronaut:micronaut-validation")
+    implementation("io.micronaut:micronaut-http-client")
+    implementation("io.micronaut:micronaut-runtime")
+    implementation("javax.annotation:javax.annotation-api")
+    runtimeOnly("ch.qos.logback:logback-classic")
+    runtimeOnly("ch.qos.logback.contrib:logback-json-classic:0.1.5")
+    compileOnly("org.graalvm.nativeimage:svm")
+
+    implementation("io.micronaut:micronaut-validation")
+    implementation("io.micronaut.aws:micronaut-function-aws")
+    implementation("io.micronaut.aws:micronaut-function-aws-custom-runtime")
+    implementation("io.micronaut.aws:micronaut-aws-sdk-v2")
+
+    implementation "com.google.guava:guava:30.1.1-jre"
+    implementation "software.amazon.awssdk:dynamodb", {
+        exclude group: "software.amazon.awssdk", module: "apache-client"
+        exclude group: "software.amazon.awssdk", module: "netty-nio-client"
+    }
+    implementation "software.amazon.awssdk:url-connection-client"
+
+    testImplementation("io.micronaut:micronaut-function")
+}
+
+
+application {
+    mainClass.set("com.x10.lambda.UserLambdaRuntime")
+}
+
+dockerfileNative {
+    args "-Dio.netty.allocator.numDirectArenas=0", "-Dio.netty.noPreferDirect=true"
+
+}
+
+java {
+    sourceCompatibility = JavaVersion.toVersion("11")
+    targetCompatibility = JavaVersion.toVersion("11")
+}
+
+tasks.named("assemble") {
+    dependsOn(":shadowJar")
+}
+
+import software.amazon.awssdk.core.SdkBytes
+import software.amazon.awssdk.services.lambda.LambdaClient
+import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider
+import software.amazon.awssdk.regions.Region
+import software.amazon.awssdk.core.exception.SdkException
+import software.amazon.awssdk.services.lambda.model.LogType
+
+import java.nio.charset.StandardCharsets
+import java.util.regex.Pattern
+
+def getLambdaClient() {
+    def builder = LambdaClient.builder()
+    if (project.hasProperty("awsProfile")) {
+        builder.credentialsProvider(ProfileCredentialsProvider.builder()
+                .profileName(project.property("awsProfile").toString())
+                .build())
+    }
+    if (project.hasProperty("awsRegion")) {
+        builder.region(Region.of(project.property("awsRegion").toString()))
+    }
+    return builder.build()
+}
+
+def doDeployNativeLambda(LambdaClient lambda) {
+    def functionName = project.property("nativeFunction").toString()
+    def zipFile = file(buildNativeLambda.hostPath)
+    def functionCode = SdkBytes.fromInputStream(new FileInputStream(zipFile))
+    try {
+        logger.quiet("Updating ${functionName} with code in ${zipFile}")
+        lambda.updateFunctionCode({
+            it.zipFile(functionCode)
+                    .functionName(functionName)
+        })
+        logger.quiet("Waiting for ${functionName} to finish updating")
+        lambda.waiter()
+                .waitUntilFunctionUpdated({
+                    it.functionName(functionName)
+                })
+    } catch (SdkException e) {
+        logger.error("Could not update function ${functionName}")
+        logger.error("You can set awsProfile and awsRegion in gradle.properties to change region and AWS profile")
+        throw e
+    }
+}
+
+def doDeployVmLambda(LambdaClient lambda) {
+    def functionName = project.property("vmFunction").toString()
+    def zipFile = file(shadowJar.archiveFile)
+    def functionCode = SdkBytes.fromInputStream(new FileInputStream(zipFile))
+    try {
+        logger.quiet("Updating ${functionName} with code in ${zipFile}")
+        lambda.updateFunctionCode({
+            it.zipFile(functionCode)
+                    .functionName(functionName)
+        })
+        logger.quiet("Waiting for ${functionName} to finish updating")
+        lambda.waiter()
+                .waitUntilFunctionUpdated({
+                    it.functionName(functionName)
+                })
+    } catch (SdkException e) {
+        logger.error("Could not update function ${functionName}")
+        logger.error("You can set awsProfile and awsRegion in gradle.properties to change region and AWS profile")
+        throw e
+    }
+}
+
+def doFunctionBenchMark(LambdaClient lambda, String functionName, boolean requireInit, Closure resetFunction) {
+    def reportPattern = Pattern.compile("REPORT RequestId: [a-z0-9-]+\\s+Duration: (?<duration>[0-9.]+) ms\\s+Billed Duration: (?<billed>[0-9.]+) ms\\s+Memory Size: [0-9]+ MB\\s+Max Memory Used: [0-9]+ MB(\\sInit Duration: (?<init>[0-9.]+) ms)?")
+    def invocations = []
+    for (def i = 1; invocations.size() < 100; i++) {
+        resetFunction(i)
+        logger.quiet("Invocation ${i}")
+        def payload = "{ \"name\": \"John Doe\" }"
+        def response = lambda.invoke({
+            it.functionName(functionName)
+                    .payload(SdkBytes.fromString(payload, StandardCharsets.UTF_8))
+            it.logType(LogType.TAIL)
+        })
+        if (response.statusCode() >= 300) {
+            logger.warn("Invocation failed with status " + response.statusCode())
+            logger.warn(response.payload().asString(StandardCharsets.UTF_8))
+        } else {
+            def tail = new String(Base64.decoder.decode(response.logResult()), StandardCharsets.UTF_8)
+            def match = reportPattern.matcher(tail)
+            if (match.find()) {
+                def duration = Double.parseDouble(match.group("duration"))
+                def init = Double.parseDouble(match.group("init") ?: "0")
+                if (requireInit && match.group("init") == null) {
+                    logger.quiet("Disregarding since no init duration is present")
+                    continue
+                }
+                logger.quiet("Duration: {} ms Init: {} ms", duration, init)
+                invocations.add(duration + init)
+            } else {
+                logger.warn("No match found: {}", tail)
+            }
+        }
+    }
+    invocations.sort(Comparator.naturalOrder())
+    def min = invocations[0]
+    def max = invocations[invocations.size() - 1]
+    def mean = invocations.sum() / invocations.size()
+    def median = invocations[invocations.size() / 2]
+    def p95 = invocations[Math.min(invocations.size() - 1, (int)(invocations.size() * 0.95).round())]
+    logger.quiet(String.format("Min: %.3f ms, max: %.3f ms, mean: %.3f ms, median: %.3f ms, p95: %.3f ms", min, max, mean, median, p95))
+    logger.quiet(invocations.toString())
+}
+
+task deployNativeLambda() {
+    dependsOn "buildNativeLambda"
+    doLast {
+        doDeployNativeLambda(getLambdaClient())
+    }
+}
+
+task benchNativeLambdaColdStarts() {
+    doLast {
+        def lambda = getLambdaClient()
+        def functionName = project.property("nativeFunction").toString()
+        doFunctionBenchMark(lambda, functionName, true) { testrun ->
+            def variables = lambda.getFunctionConfiguration {
+                it.functionName(functionName)
+            }.environment().variables()
+            variables = new HashMap(variables)
+            variables.put("TESTRUN", testrun.toString())
+            lambda.updateFunctionConfiguration {
+                it.environment { env ->
+                    env.variables(variables)
+                }
+                        .functionName(functionName)
+            }
+            lambda.waiter()
+                    .waitUntilFunctionUpdated {
+                        it.functionName(functionName)
+                    }
+        }
+    }
+}
+
+task benchNativeLambda() {
+    doLast {
+        def lambda = getLambdaClient()
+        def functionName = project.property("nativeFunction").toString()
+        doFunctionBenchMark(lambda, functionName, false) {}
+    }
+}
+
+task deployVmLambda() {
+    dependsOn shadowJar
+    doLast {
+        doDeployVmLambda(getLambdaClient())
+    }
+}
+
+task benchVmLambdaColdStarts() {
+    doLast {
+        def lambda = getLambdaClient()
+        def functionName = project.property("vmFunction").toString()
+        doFunctionBenchMark(lambda, functionName, true) { testrun ->
+            def variables = lambda.getFunctionConfiguration {
+                it.functionName(functionName)
+            }.environment().variables()
+            variables = new HashMap(variables)
+            variables.put("TESTRUN", testrun.toString())
+            lambda.updateFunctionConfiguration {
+                it.environment { env ->
+                    env.variables(variables)
+                }
+                        .functionName(functionName)
+            }
+            lambda.waiter()
+                    .waitUntilFunctionUpdated {
+                        it.functionName(functionName)
+                    }
+        }
+    }
+}
+
+task benchVmLambda() {
+    doLast {
+        def lambda = getLambdaClient()
+        def functionName = project.property("vmFunction").toString()
+        doFunctionBenchMark(lambda, functionName, false) {}
+    }
+}

@@ -1,1 +1,2 @@
 include "spring-cf-lambda"
+include "graalvm-micronaut-lambda"
